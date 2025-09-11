@@ -977,22 +977,25 @@ pub struct Permit {
 impl Permit {
     /// Consume the permit by placing an entry into the Completion Queue.
     pub fn complete(self, comp: Completion) {
+        if let Some(cq) = self.push_completion(comp) {
+            cq.fire_interrupt();
+        }
+    }
+
+    fn push_completion(self, comp: Completion) -> Option<Arc<CompQueue>> {
         let Permit { cq, sq, cid, _nodrop, .. } = self;
         std::mem::forget(_nodrop);
 
-        let cq = match cq.upgrade() {
-            Some(cq) => cq,
-            None => {
-                // The CQ has since been deleted so no way to complete this
-                // request nor to return the permit.
-                debug_assert!(sq.upgrade().is_none());
-                return;
-            }
+        let Some(cq) = cq.upgrade() else {
+            // The CQ has since been deleted so no way to complete this
+            // request nor to return the permit.
+            debug_assert!(sq.upgrade().is_none());
+            return None;
         };
 
         if let Some(sq) = sq.upgrade() {
             cq.push(comp, cid, &sq);
-            cq.fire_interrupt();
+            Some(cq)
         } else {
             // The SQ has since been deleted (so the request has already
             // implicitly been aborted by the prior Delete Queue command) or
@@ -1001,6 +1004,7 @@ impl Permit {
             // Just make sure we return the "avail hold" from the permit
             let mut state = cq.state.lock();
             state.release_avail();
+            None
         }
     }
 
@@ -1058,6 +1062,38 @@ struct NoDropPermit;
 impl Drop for NoDropPermit {
     fn drop(&mut self) {
         panic!("Permit should be complete()-ed before drop");
+    }
+}
+
+pub struct BulkCompletion {
+    last_cq: Option<Arc<CompQueue>>,
+}
+impl BulkCompletion {
+    pub fn new() -> Self {
+        Self { last_cq: None }
+    }
+    pub fn process(&mut self, permit: Permit, comp: Completion) {
+        self.last_cq = match (self.last_cq.take(), permit.push_completion(comp))
+        {
+            (Some(lcq), Some(cq)) if !Arc::ptr_eq(&lcq, &cq) => {
+                // A surprise that bulked completions target more than one CQ,
+                // but deal with it anyways.
+                lcq.fire_interrupt();
+                Some(cq)
+            }
+            (_, Some(cq)) => Some(cq),
+            _ => None,
+        }
+    }
+    pub fn finish(self) {
+        // Drop handler will deal with final interrupt firing
+    }
+}
+impl Drop for BulkCompletion {
+    fn drop(&mut self) {
+        if let Some(cq) = self.last_cq.take() {
+            cq.fire_interrupt()
+        }
     }
 }
 

@@ -5,7 +5,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{cmds::NvmCmd, queue::Permit, PciNvme};
+use super::queue::{self, Permit};
+use super::{cmds::NvmCmd, PciNvme};
 use crate::accessors::MemAccessor;
 use crate::block::{self, Operation, Request};
 use crate::hw::nvme::{bits, cmds::Completion, queue::SubQueue};
@@ -133,25 +134,17 @@ impl block::DeviceQueue for NvmeBlockQueue {
         result: block::Result,
         permit: Self::Token,
     ) {
-        let qid = permit.sqid();
-        let cid = permit.cid();
-        let resnum = result as u8;
-        match op {
-            Operation::Read(..) => {
-                probes::nvme_read_complete!(|| (qid, cid, resnum));
-            }
-            Operation::Write(..) => {
-                probes::nvme_write_complete!(|| (qid, cid, resnum));
-            }
-            Operation::Flush => {
-                probes::nvme_flush_complete!(|| (qid, cid, resnum));
-            }
-            Operation::Discard(..) => {
-                unreachable!("discard not supported in NVMe for now");
-            }
-        }
+        let comp = generate_completion(op, result, &permit);
+        permit.complete(comp);
+    }
 
-        permit.complete(Completion::from(result));
+    fn complete_bulk(&self, completions: block::BulkCompletions<Self::Token>) {
+        let mut bulk = queue::BulkCompletion::new();
+        for (op, result, permit) in completions {
+            let comp = generate_completion(op, result, &permit);
+            bulk.process(permit, comp)
+        }
+        bulk.finish();
     }
 
     /// In the unlikely case we must give up on an in-flight I/O, tear it down
@@ -159,4 +152,31 @@ impl block::DeviceQueue for NvmeBlockQueue {
     fn abandon(&self, token: Self::Token) {
         token.abandon();
     }
+}
+
+#[inline(always)]
+fn generate_completion(
+    op: block::Operation,
+    result: block::Result,
+    permit: &Permit,
+) -> Completion {
+    let qid = permit.sqid();
+    let cid = permit.cid();
+    let resnum = result as u8;
+    match op {
+        Operation::Read(..) => {
+            probes::nvme_read_complete!(|| (qid, cid, resnum));
+        }
+        Operation::Write(..) => {
+            probes::nvme_write_complete!(|| (qid, cid, resnum));
+        }
+        Operation::Flush => {
+            probes::nvme_flush_complete!(|| (qid, cid, resnum));
+        }
+        Operation::Discard(..) => {
+            unreachable!("discard not supported in NVMe for now");
+        }
+    }
+
+    Completion::from(result)
 }

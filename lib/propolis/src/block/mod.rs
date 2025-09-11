@@ -33,7 +33,7 @@ pub use attachment::{
     attach, AsyncWorkerCtx, AttachError, BackendAttachment, DeviceAttachment,
     SyncWorkerCtx,
 };
-pub use minder::{DeviceQueue, DeviceRequest};
+pub use minder::{BulkCompletions, DeviceQueue, DeviceRequest};
 
 pub type ByteOffset = usize;
 pub type ByteLen = usize;
@@ -85,7 +85,13 @@ mod probes {
     ) {
     }
 
-    fn block_completion_sent(devq_id: u64, req_id: u64, complete_ns: u64) {}
+    fn block_completion_single(devq_id: u64, complete_ns: u64) {}
+    fn block_completion_coalesced(
+        devq_id: u64,
+        complete_ns: u64,
+        count: usize,
+    ) {
+    }
 
     fn block_poll(devq_id: u64, worker_id: u64, emit_req: u8) {}
     fn block_sleep(dev_id: u32, worker_id: u64) {}

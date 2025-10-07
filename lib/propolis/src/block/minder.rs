@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use pin_project_lite::pin_project;
-use tokio::sync::futures::Notified;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::Notify;
 
 use crate::block::attachment::Bitmap;
@@ -141,7 +141,7 @@ pub(super) struct QueueMinder {
     pub device_id: DeviceId,
     state: Mutex<QmInner>,
     self_ref: Weak<Self>,
-    notify: Notify,
+    notify: Arc<Notify>,
     /// Type-erased wrapper function for [DeviceQueue::next_req()]
     next_req_fn: NextReqFn,
     /// Type-erased wrapper function for [DeviceQueue::complete()]
@@ -178,7 +178,7 @@ impl QueueMinder {
             device_id,
             state: Mutex::new(QmInner::default()),
             self_ref: self_ref.clone(),
-            notify: Notify::new(),
+            notify: Arc::new(Notify::new()),
             next_req_fn,
             complete_req_fn,
         })
@@ -350,19 +350,22 @@ impl QueueMinder {
     /// being processed by an attached backend.  An [Ok] result from this future
     /// indicates that all requests have finished their
     /// [DeviceQueue::complete()] call.
-    pub(crate) fn none_in_flight(&self) -> NoneInFlight<'_> {
-        NoneInFlight { minder: self, wait: self.notify.notified() }
+    pub(crate) fn none_in_flight(self: &Arc<Self>) -> NoneInFlight {
+        NoneInFlight {
+            minder: Arc::clone(self),
+            wait: Arc::clone(&self.notify).notified_owned(),
+        }
     }
 }
 
 pin_project! {
-    pub(crate) struct NoneInFlight<'a> {
-        minder: &'a QueueMinder,
+    pub(crate) struct NoneInFlight {
+        minder: Arc<QueueMinder>,
         #[pin]
-        wait: Notified<'a>
+        wait: OwnedNotified,
     }
 }
-impl Future for NoneInFlight<'_> {
+impl Future for NoneInFlight {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -373,9 +376,10 @@ impl Future for NoneInFlight<'_> {
             if state.in_flight.is_empty() && state.processing_last == 0 {
                 return Poll::Ready(());
             }
-            if let Poll::Ready(_) = Notified::poll(this.wait.as_mut(), cx) {
+            if let Poll::Ready(_) = OwnedNotified::poll(this.wait.as_mut(), cx)
+            {
                 // Refresh fused future from Notify
-                this.wait.set(this.minder.notify.notified());
+                this.wait.set(Arc::clone(&this.minder.notify).notified_owned());
             } else {
                 return Poll::Pending;
             }

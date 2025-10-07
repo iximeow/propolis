@@ -36,7 +36,7 @@ use futures::Stream;
 use pin_project_lite::pin_project;
 use strum::IntoStaticStr;
 use thiserror::Error;
-use tokio::sync::futures::Notified;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::Notify;
 
 /// Static for generating unique block [DeviceId]s with a process
@@ -267,7 +267,7 @@ pin_project! {
         #[pin]
         minders: MinderRefs,
         #[pin]
-        unordered: FuturesUnordered<NoneInFlight<'static>>,
+        unordered: FuturesUnordered<NoneInFlight>,
         loaded: bool,
     }
 }
@@ -277,18 +277,8 @@ impl Future for NoneProcessing {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         if !*this.loaded {
-            for minder in this.minders.values.iter().map(Arc::as_ref) {
-                // # SAFETY
-                //
-                // With the Vec<Arc<QueueMinder>> pinned (and barred via marker
-                // from Unpin), it should not be possible to remove them for the
-                // lifetime of this future.  With that promised to us, we can
-                // extend the lifetime of the QueueMinder references long enough
-                // to run the NoneInFlight futures.
-                let extended: &'static QueueMinder =
-                    unsafe { std::mem::transmute(minder) };
-
-                this.unordered.push(extended.none_in_flight());
+            for minder in this.minders.values.iter() {
+                this.unordered.push(Arc::clone(minder).none_in_flight());
             }
             *this.loaded = true;
         }
@@ -583,7 +573,7 @@ pub(crate) struct WorkerSlot {
     state: Mutex<WorkerState>,
     acc_mem: MemAccessor,
     cv: Condvar,
-    notify: Notify,
+    notify: Arc<Notify>,
     id: WorkerId,
 }
 impl WorkerSlot {
@@ -592,7 +582,7 @@ impl WorkerSlot {
             state: Mutex::new(Default::default()),
             acc_mem: MemAccessor::new_orphan(),
             cv: Condvar::new(),
-            notify: Notify::new(),
+            notify: Arc::new(Notify::new()),
             id,
         }
     }
@@ -1144,7 +1134,7 @@ pin_project! {
         slot: &'a WorkerSlot,
         sleeping_on: Option<DeviceId>,
         #[pin]
-        wait: Notified<'a>
+        wait: OwnedNotified
     }
 
     impl PinnedDrop for WaitForReq<'_> {
@@ -1159,7 +1149,7 @@ pin_project! {
 
 impl WaitForReq<'_> {
     fn new<'a>(slot: &'a WorkerSlot) -> WaitForReq<'a> {
-        let wait = slot.notify.notified();
+        let wait = Arc::clone(&slot.notify).notified_owned();
         WaitForReq { slot, sleeping_on: None, wait }
     }
 }
@@ -1185,12 +1175,14 @@ impl Future for WaitForReq<'_> {
                     this.slot.async_start_sleep(state, devid);
 
                     if let Poll::Ready(_) =
-                        Notified::poll(this.wait.as_mut(), cx)
+                        OwnedNotified::poll(this.wait.as_mut(), cx)
                     {
                         // The `Notified` future is fused, so we must "refresh"
                         // prior to any subsequent attempts to poll it after it
                         // emits `Ready`
-                        this.wait.set(this.slot.notify.notified());
+                        this.wait.set(
+                            Arc::clone(&this.slot.notify).notified_owned(),
+                        );
 
                         // Take another lap if woken by the notifier to check
                         // for a pending request

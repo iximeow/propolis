@@ -10,8 +10,10 @@ use std::sync::{
 };
 
 use propolis::{
+    accessors::MemAccessor,
     bhyve_api,
     exits::{self, SuspendDetail, VmExitKind},
+    pio::PioBus,
     vcpu::Vcpu,
     VmEntry,
 };
@@ -37,6 +39,22 @@ pub(crate) trait VcpuTaskController: Send + Sync + 'static {
     fn exit_all(&mut self);
 }
 
+/// A small struct to smuggle bits of `Machine` into `vcpu_loop`.
+///
+/// It'd be more "normal" to have an `Arc<Machine>` here, but in
+/// `propolis-server` the `Vcpu` are set up as part of getting to a `Machine`.
+/// Which makes it hard to have an `Arc<Machine>` this early. Instead, hold on
+/// to the few parts of `Machine` we'll need for VM exit handling later.
+///
+/// This should be OK because vCPU tasks live and die with the `Machine`. We
+/// won't have to "re-attach" a vCPU task to a new Machine, for example, so
+/// tightly binding with no provision for updating attachments later is fine
+/// just this once.
+struct VcpuMachineState {
+    bus_pio: Arc<PioBus>,
+    acc_mem: MemAccessor,
+}
+
 impl VcpuTasks {
     pub(crate) fn new(
         machine: &propolis::Machine,
@@ -51,11 +69,25 @@ impl VcpuTasks {
             let task_log = log.new(slog::o!("vcpu" => vcpu.id));
             let task_event_handler = event_handler.clone();
             let task_gen = generation.clone();
+
+            // I don't *think* vCPU structs outlive the Machine they're a part
+            // of (unlike devices etc, which do outlive kernel VMMs since they
+            // have interesting migration state etc).  So just attach to the
+            // machine's MemAccessor here and have no provision for re-attaching
+            // to some subsequent Machine instance.
+            let acc_mem = MemAccessor::new_orphan();
+            machine.acc_mem.adopt(&acc_mem, None);
+            let state = VcpuMachineState {
+                bus_pio: Arc::clone(&machine.bus_pio),
+                acc_mem: acc_mem,
+            };
+
             let thread = std::thread::Builder::new()
                 .name(format!("vcpu-{}", vcpu.id))
                 .spawn(move || {
                     Self::vcpu_loop(
                         vcpu.as_ref(),
+                        state,
                         task,
                         task_event_handler,
                         task_gen,
@@ -71,9 +103,11 @@ impl VcpuTasks {
 
     fn vcpu_loop(
         vcpu: &Vcpu,
+        state: VcpuMachineState,
         task: propolis::tasks::TaskHdl,
         event_handler: Arc<dyn super::vm::guest_event::VcpuEventHandler>,
         generation: Arc<AtomicUsize>,
+
         log: slog::Logger,
     ) {
         info!(log, "Starting vCPU thread");
@@ -196,15 +230,77 @@ impl VcpuTasks {
                         VmEntry::Run
                     }
                     VmExitKind::InstEmul(inst) => {
-                        let diag = propolis::vcpu::Diagnostics::capture(vcpu);
-                        error!(log,
-                               "instruction emulation exit on vCPU {}",
-                               vcpu.id;
-                               "context" => ?inst,
-                               "vcpu_state" => %diag);
+                        if &inst.inst_data[..2] == &[0xf3, 0x6c] {
+                            // rep ins dx, byte [rdi]
+                            let rcx = vcpu.get_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RCX).unwrap();
+                            let rdx = vcpu.get_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RDX).unwrap();
+                            let rdi = vcpu.get_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RDI).unwrap();
 
-                        event_handler.unhandled_vm_exit(vcpu.id, exit.kind);
-                        VmEntry::Run
+                            let memctx = state.acc_mem.access().unwrap();
+                            // if you want to put more than 16k over serial at once what is wrong
+                            // with you.
+                            assert!(rcx < 0x4000);
+                            let mut buf = vec![0u8; rcx as usize];
+
+                            for i in 0..(rcx as usize) {
+                                buf[i] = state
+                                    .bus_pio
+                                    .handle_in(rdx as u16, 1)
+                                    .expect("can port i/o") as u8;
+                            }
+
+                            use propolis::common::GuestAddr;
+                            use propolis::common::GuestData;
+                            memctx.write_from(
+                                GuestAddr(rdi),
+                                &mut GuestData::from(buf.as_mut_slice()),
+                                rcx as usize
+                            ).expect("ok");
+
+                            vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RDI, rdi + rcx).unwrap();
+                            vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RCX, 0).unwrap();
+
+                            VmEntry::Run
+                        } else if &inst.inst_data[..2] == &[0xf3, 0x6e] {
+                            // rep outs dl, byte [rsi]
+                            let rcx = vcpu.get_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RCX).unwrap();
+                            let rdx = vcpu.get_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RDX).unwrap();
+                            let rsi = vcpu.get_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RSI).unwrap();
+
+                            let memctx = state.acc_mem.access().unwrap();
+                            // if you want to put more than 16k over serial at once what is wrong
+                            // with you.
+                            assert!(rcx < 0x4000);
+                            let mut buf = vec![0u8; rcx as usize];
+                            use propolis::common::GuestAddr;
+                            use propolis::common::GuestData;
+                            memctx.read_into(
+                                GuestAddr(rsi),
+                                &mut GuestData::from(buf.as_mut_slice()),
+                                rcx as usize
+                            ).expect("ok");
+
+                            for i in 0..(rcx as usize) {
+                                state
+                                    .bus_pio
+                                    .handle_out(rdx as u16, 1, buf[i] as u32)
+                                    .expect("can port i/o");
+                            }
+                            vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RSI, rsi + rcx).unwrap();
+                            vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RCX, 0).unwrap();
+
+                            VmEntry::Run
+                        } else {
+                            let diag = propolis::vcpu::Diagnostics::capture(vcpu);
+                            error!(log,
+                                   "instruction emulation exit on vCPU {}",
+                                   vcpu.id;
+                                   "context" => ?inst,
+                                   "vcpu_state" => %diag);
+
+                            event_handler.unhandled_vm_exit(vcpu.id, exit.kind);
+                            VmEntry::Run
+                        }
                     }
                     VmExitKind::Unknown(code) => {
                         error!(log,

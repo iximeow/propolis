@@ -52,6 +52,7 @@ tempfile.workspace = true
 slog-term.workspace = true
 slog-async.workspace = true
 rand.workspace = true
+ron.workspace = true
 
 [features]
 default = []

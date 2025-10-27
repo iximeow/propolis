@@ -1534,3 +1534,395 @@ lazy_static! {
         }
     };
 }
+
+#[cfg(test)]
+mod test {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use crate::hw::pci::{
+        BusLocation, Endpoint,
+    };
+    use crate::block::{self, Backend, BackendOpts, InMemoryBackend};
+    use crate::migrate::{MigrateCtx, MigrateMulti, PayloadOffer, PayloadOffers, PayloadOutputs};
+
+    use crate::hw::nvme::NvmeError;
+    use crate::hw::nvme::PciNvme;
+
+    use crate::hw::nvme::AdminQueueAttrs;
+    use crate::hw::nvme::Configuration;
+
+    use crate::hw::nvme::CtrlrReg;
+    use crate::hw::nvme::SubmissionQueueEntry;
+    use crate::hw::nvme::GuestAddr;
+    use crate::hw::nvme::WriteOp;
+
+    use crate::lifecycle::Lifecycle;
+
+    use slog::{Discard, Logger};
+
+    #[test]
+    fn fuzzy() -> Result<(), NvmeError> {
+        let log = Logger::root(Discard, slog::o!());
+        // The mutex ensures atomicity of random concurrent migrations. In a
+        // real guest, PCI register writes would be stopped as vCPUs are
+        // quiesced for migration.
+        let nvme = Arc::new(Mutex::new(PciNvme::create(
+            b"11112222333344445555",
+            None,
+            log.clone(),
+        )));
+
+        let scaffold = Arc::new(crate::hw::pci::test::Scaffold::new());
+        use crate::vmm::PhysMap;
+        let mut map = PhysMap::new_test(2 * 1024 * 1024);
+        map.add_test_mem("test-ram".to_string(), 1024 * 1024, 1024 * 1024)
+            .expect("can create test memory region");
+        let root_mem = map.finalize();
+        root_mem.adopt(&scaffold.acc_mem, None);
+
+        let bus = Arc::new(Mutex::new(scaffold.create_bus()));
+
+        let backend = Arc::new(InMemoryBackend::create(
+            vec![0; 64 * 1024 * 1024],
+            BackendOpts {
+                block_size: Some(512),
+                read_only: Some(false),
+                skip_flush: Some(false),
+            },
+            NonZeroUsize::new(1).unwrap()
+        ).unwrap());
+
+        let nvme_guard = nvme.lock().unwrap();
+
+        block::attach(&nvme_guard.block_attach, backend.attachment()).unwrap();
+        bus.lock().unwrap().attach(
+            BusLocation::new(0, 0).unwrap(),
+            Arc::clone(&nvme_guard) as Arc<dyn Endpoint>,
+            None,
+        );
+
+        drop(nvme_guard);
+
+        let nvme_ref = Arc::clone(&nvme);
+        let acc_mem = scaffold.acc_mem.child(Some("fake guest".to_string()));
+
+        const SQE_SIZE: usize = std::mem::size_of::<SubmissionQueueEntry>();
+        const ADMIN_SQ_SIZE: u16 = 1024;
+        const ADMIN_CQ_SIZE: u16 = 1024;
+
+        const IO_QUEUE_ENTRIES: u16 = 64;
+
+        let read_base = GuestAddr(1024 * 1024);
+        let write_base = read_base + SQE_SIZE * (ADMIN_SQ_SIZE as usize);
+
+        // I/O queues are interleaved in memory (for fun more than
+        // anything else) and placed at the end of the test region
+        // (again, just because).
+        //
+        // with 256 KiB for queues, we can have 64 I/O queues, such as
+        // 32 submission queues and 32 completion queues.
+        let io_queue_base = read_base + 768 * 1024;
+        const IOQ_SIZE: usize = SQE_SIZE * (IO_QUEUE_ENTRIES as usize);
+        let queue_base_addr = move |i: usize| {
+            assert!(i < 32, "invalid I/O queue id");
+            io_queue_base + i * IOQ_SIZE
+        };
+
+        std::thread::spawn(move || {
+            let mut i = 0;
+            let nvme = nvme_ref;
+            let acc_mem = acc_mem;
+
+            loop {
+                // set up a 1024-entry admin submission queue, and 1024-entry admin completion
+                // queue. each of these are 64kb (64 * 1024) bytes in total.
+                nvme.lock().unwrap().reg_ctrl_write(
+                    &CtrlrReg::AdminQueueAttr,
+                    &mut WriteOp::from_buf(0, &AdminQueueAttrs(0)
+                        .with_asqs(ADMIN_SQ_SIZE)
+                        .with_acqs(ADMIN_CQ_SIZE)
+                        .0.to_le_bytes())
+                ).expect("can set admin queue attrs");
+
+                // `Machine::new_test` puts RAM at 1MiB..2MiB, so we'll put the submission queue at
+                // 1MiB and the completion queue at 1Mib + 64KiB
+                nvme.lock().unwrap().reg_ctrl_write(
+                    &CtrlrReg::AdminSubQAddr,
+                    &mut WriteOp::from_buf(0, &read_base.0.to_le_bytes())
+                ).expect("can set admin submission queue addr");
+
+                nvme.lock().unwrap().reg_ctrl_write(
+                    &CtrlrReg::AdminCompQAddr,
+                    &mut WriteOp::from_buf(0, &write_base.0.to_le_bytes())
+                ).expect("can set admin completion queue addr");
+
+                let cfg = Configuration(0)
+                    .with_enabled(true)
+                    .with_iosqes(6)
+                    .with_iocqes(4)
+                    .0.to_le_bytes();
+
+                nvme.lock().unwrap().reg_ctrl_write(
+                    &CtrlrReg::CtrlrCfg,
+                    &mut WriteOp::from_buf(0, &cfg)
+                ).expect("can set controller config");
+
+                for qpid in 1..16u32 {
+                    if i % (1 * 1024) == 0 {
+                        eprintln!("doing queue pair {}", qpid);
+                    }
+                    let create_queue = SubmissionQueueEntry {
+                        cdw0: ((qpid * 4) << 16) | 0x00_05, // CID=1, ADMIN_OPC_CREATE_IO_CQ
+                        // queue size = 256, queue id = qpid
+                        cdw10: (IO_QUEUE_ENTRIES as u32) << 16 | qpid,
+                        // IV 2, interrupts enabled, is physically contiguous
+                        cdw11: 0x0002_0003,
+                        prp1: queue_base_addr(qpid as usize * 2).0,
+                        // unused for queue creation
+                        prp2: 0,
+                        nsid: 0,
+                        rsvd: 0,
+                        mptr: 0,
+                        cdw12: 0,
+                        cdw13: 0,
+                        cdw14: 0,
+                        cdw15: 0,
+                    };
+
+                    acc_mem.access().unwrap().write(
+                        read_base + std::mem::size_of::<SubmissionQueueEntry>() * (qpid as usize * 4),
+                        &create_queue
+                    );
+
+                    let res = nvme.lock().unwrap().reg_ctrl_write(
+                        &CtrlrReg::DoorBellAdminSQ,
+                        &mut WriteOp::from_buf(0, &(qpid * 4u32).to_le_bytes()),
+                    );
+
+                    match res {
+                        Ok(_) => { /* ok */ },
+                        Err(NvmeError::InvalidSubQueue(0)) => {
+                            // it's possible the controller was just reset, in
+                            // which case the corresponding completion queue was
+                            // destroyed 
+                        },
+                        Err(other) => {
+                            panic!("other error: {other:?}");
+                        }
+                    }
+
+                    let create_submission_queue = SubmissionQueueEntry {
+                        // pick a CID that is unique, ADMIN_OPC_CREATE_IO_SQ
+                        cdw0: ((qpid * 4 + 1) << 16) | 0x00_01,
+                        // queue size = 256, queue id = qpid
+                        cdw10: (IO_QUEUE_ENTRIES as u32) << 16 | qpid,
+                        // completions go to cq 2, is physically contiguous
+                        cdw11: (qpid << 16) | 0x0001,
+                        prp1: queue_base_addr(qpid as usize * 2 + 1).0,
+                        // unused for queue creation
+                        prp2: 0,
+                        nsid: 0,
+                        rsvd: 0,
+                        mptr: 0,
+                        cdw12: 0,
+                        cdw13: 0,
+                        cdw14: 0,
+                        cdw15: 0,
+                    };
+
+                    acc_mem.access().unwrap().write(
+                        read_base + std::mem::size_of::<SubmissionQueueEntry>() * (qpid as usize * 4 + 1),
+                        &create_submission_queue
+                    );
+
+                    let res = nvme.lock().unwrap().reg_ctrl_write(
+                        &CtrlrReg::DoorBellAdminSQ,
+                        &mut WriteOp::from_buf(0, &(qpid * 4u32 + 1).to_le_bytes()),
+                    );
+
+                    match res {
+                        Ok(_) => { /* ok */ },
+                        Err(NvmeError::InvalidSubQueue(0)) => {
+                            // it's possible the controller was just reset, in
+                            // which case the corresponding completion queue was
+                            // destroyed 
+                        },
+                        Err(other) => {
+                            panic!("other error: {other:?}");
+                        }
+                    }
+                }
+
+                for qpid in 1..16 {
+                    // now go delete the queues!
+                    let create_queue = SubmissionQueueEntry {
+                        cdw0: ((qpid * 4 + 2) << 16) | 0x00_04, // CID=1, ADMIN_OPC_DELETE_IO_CQ
+                        cdw10: qpid,
+                        cdw11: 0,
+                        prp1: 0,
+                        prp2: 0,
+                        nsid: 0,
+                        rsvd: 0,
+                        mptr: 0,
+                        cdw12: 0,
+                        cdw13: 0,
+                        cdw14: 0,
+                        cdw15: 0,
+                    };
+
+                    acc_mem.access().unwrap().write(
+                        read_base + std::mem::size_of::<SubmissionQueueEntry>() * (qpid as usize * 4 + 2),
+                        &create_queue
+                    );
+
+                    let res = nvme.lock().unwrap().reg_ctrl_write(
+                        &CtrlrReg::DoorBellAdminSQ,
+                        &mut WriteOp::from_buf(0, &(qpid * 4u32 + 2).to_le_bytes()),
+                    );
+
+                    match res {
+                        Ok(_) => { /* ok */ },
+                        Err(NvmeError::InvalidSubQueue(0)) => {
+                            // it's possible the controller was just reset, in
+                            // which case the corresponding completion queue was
+                            // destroyed 
+                        },
+                        Err(other) => {
+                            panic!("other error: {other:?}");
+                        }
+                    }
+
+                    let create_submission_queue = SubmissionQueueEntry {
+                        // pick a CID that is unique, ADMIN_OPC_DELETE_IO_SQ
+                        cdw0: ((qpid * 4 + 3) << 16) | 0x00_00,
+                        cdw10: qpid,
+                        cdw11: 0,
+                        prp1: 0,
+                        prp2: 0,
+                        nsid: 0,
+                        rsvd: 0,
+                        mptr: 0,
+                        cdw12: 0,
+                        cdw13: 0,
+                        cdw14: 0,
+                        cdw15: 0,
+                    };
+
+                    acc_mem.access().unwrap().write(
+                        read_base + std::mem::size_of::<SubmissionQueueEntry>() * (qpid as usize * 4 + 3),
+                        &create_submission_queue
+                    );
+
+                    let res = nvme.lock().unwrap().reg_ctrl_write(
+                        &CtrlrReg::DoorBellAdminSQ,
+                        &mut WriteOp::from_buf(0, &(qpid * 4u32 + 3).to_le_bytes()),
+                    );
+
+                    match res {
+                        Ok(_) => { /* ok */ },
+                        Err(NvmeError::InvalidSubQueue(0)) => {
+                            // it's possible the controller was just reset, in
+                            // which case the corresponding completion queue was
+                            // destroyed 
+                        },
+                        Err(other) => {
+                            panic!("other error: {other:?}");
+                        }
+                    }
+                }
+
+                nvme.lock().unwrap().reset();
+                // break;
+                i += 1;
+            }
+        });
+
+        let nvme_ref = Arc::clone(&nvme);
+        let backend_ref = Arc::clone(&backend);
+        let scaffold_ref = Arc::clone(&scaffold);
+        let bus_ref = Arc::clone(&bus);
+
+        std::thread::spawn(move || {
+            let nvme = nvme_ref;
+            let bus = bus_ref;
+            let scaffold = scaffold_ref;
+            loop {
+                eprintln!("migrate!");
+                std::thread::sleep(std::time::Duration::from_micros(3714));
+
+                let mut nvme_guard = nvme.lock().unwrap();
+
+                let mut payload_outputs = PayloadOutputs::new();
+                let acc_mem = scaffold.acc_mem.access().unwrap();
+                let migrate_ctx = MigrateCtx {
+                    mem: &acc_mem,
+                };
+
+                nvme_guard.export(
+                    &mut payload_outputs,
+                    &migrate_ctx).expect("can export");
+
+                *nvme_guard = PciNvme::create(
+                    b"11112222333344445555",
+                    None,
+                    log.clone(),
+                );
+
+                let mut data = Vec::new();
+                let payload_outputs = payload_outputs.into_iter().collect::<Vec<_>>();
+                let mut desers: Vec<ron::Deserializer> =
+                    Vec::with_capacity(payload_outputs.len());
+                let mut metadata: Vec<(&str, u32)> =
+                    Vec::with_capacity(payload_outputs.len());
+
+                let mut payload_offers = {
+                    for payload in payload_outputs.iter() {
+                        data.push(ron::ser::to_string(&payload.payload).expect("can serialize"));
+                    }
+                    for (payload, data) in payload_outputs.iter().zip(data.iter()) {
+                        desers.push(
+                            ron::Deserializer::from_str(data)
+                                .expect("can deserialize"));
+                        metadata.push((&payload.kind, payload.version));
+                    }
+                    let offer_iter = metadata.iter()
+                        .zip(desers.iter_mut())
+                        .map(|(meta, deser)| PayloadOffer {
+                            kind: meta.0,
+                            version: meta.1,
+                            payload: Box::new(
+                                <dyn erased_serde::Deserializer>::erase(deser),
+                            ),
+                        });
+                    PayloadOffers::new(offer_iter)
+                };
+
+
+                let mut b = bus.lock().unwrap();
+                *b = scaffold.create_bus();
+
+                block::attach(&nvme_guard.block_attach, backend_ref.attachment()).unwrap();
+
+                b.attach(
+                    BusLocation::new(0, 0).unwrap(),
+                    Arc::clone(&nvme_guard) as Arc<dyn Endpoint>,
+                    None,
+                );
+
+                nvme_guard.import(
+                    &mut payload_offers,
+                    &migrate_ctx).expect("can import");
+
+                drop(nvme_guard);
+            }
+        });
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(59));
+            nvme.lock().unwrap().reset();
+        }
+
+        Ok(())
+    }
+}

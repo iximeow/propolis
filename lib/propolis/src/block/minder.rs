@@ -115,6 +115,127 @@ impl DeviceRequest {
     }
 }
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+struct Coalescer {
+    /// The minder for which we're handling coalescing.
+    minder: Arc<QueueMinder>,
+    /// Notify to tell us that an I/O has been completed, and we should
+    /// set a deadline at which point this I/O and any that have come in
+    /// since should be flushed.
+    start_coalescing: Notify,
+    /// Notify to tell us that a batch of completions have been sent; if
+    /// we were waiting to send an interrupt we can give up and go back
+    /// to waiting for new I/Os.
+    completions_sent: Notify,
+    /// Nanos when the current batch's first completion was submitted.
+    /// "0" is a magic value indicating that no completion is currently
+    /// ongoing.
+    batch_start: AtomicU64,
+    destroyed: AtomicBool,
+}
+
+impl Coalescer {
+    fn new(minder: Arc<QueueMinder>) -> Self {
+        Self {
+            minder,
+            start_coalescing: Notify::new(),
+            completions_sent: Notify::new(),
+            batch_start: AtomicU64::new(0),
+            destroyed: AtomicBool::new(false),
+        }
+    }
+
+    fn should_coalesce(&self, op: Operation, existing: &[QmResult]) -> bool {
+        // Arbitrary limits for now
+        const COALESCE_MAX_COUNT: usize = 16;
+
+        if op.is_flush() {
+            return false;
+        }
+        if existing.len() >= COALESCE_MAX_COUNT {
+            return false;
+        }
+
+        true
+    }
+
+    fn completed_io(&self) {
+        let res = self.batch_start.compare_exchange(
+            0,
+            1,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        );
+        if res.is_ok() {
+            self.start_coalescing.notify_one();
+        }
+    }
+
+    fn flush_completions(&self) {
+        // Zero batch_start before flushing completions so that if an
+        // I/O comes in while or after flushing completions it will
+        // set `batch_start` and notify us that we should start
+        // coalescing.
+        //
+        // It's possible that such a completion actually gets flushed in
+        // *this* `flush_completions()` we're about to call. In that
+        // case it's even possible that if no other completions arrive,
+        // we'll wake when the deadline is reached and attempt to flush
+        // zero completions.
+        self.batch_start.store(0, Ordering::Release);
+        let state = self.minder.state.lock().unwrap();
+        if !state.coalesced.is_empty() {
+            self.minder.flush_coalesced(state, None);
+        }
+    }
+
+    fn shutdown(&self) {
+        self.destroyed.store(true, Ordering::Release);
+        // A task is likely waiting to be told to start notifying,
+        // so kick it to let it see it's time to wrap up.
+        self.start_coalescing.notify_one();
+    }
+
+    async fn coalesce_completions(&self) {
+        loop {
+            self.start_coalescing.notified().await;
+
+            if self.destroyed.load(Ordering::Acquire) {
+                println!("QueueMinder destroed its Coalescer");
+                break;
+            }
+
+            let notify = self.completions_sent.notified();
+
+            // arbitrary choice of 100 microsecond coalescing timeout.
+            // TODO: a better number here would consider the number of
+            // queues that might be interrupted and how many I/Os we'd
+            // expect to actually accumulate inside 100us.
+            const COALESCE_MAX_WAIT: Duration = Duration::from_micros(100);
+
+            // TODO: only sleep by the difference between when the I/O
+            // was completed and now, rather than 100us from now.
+            // hopefully the difference should be tiny but tens or
+            // twenties of microseconds have been seen sunk into waiting
+            // on locks..
+            let delay = tokio::time::sleep(COALESCE_MAX_WAIT);
+
+            tokio::select! {
+                _ = notify => {
+                   // the completion batch is done, wait for another I/O to
+                   // start coalescing
+                   continue;
+                },
+                _ = delay => {
+                    // aggregation timeout, send what we've seen
+                    self.flush_completions();
+                }
+            }
+        }
+    }
+}
+
 /// Marker struct to ensure that [DeviceRequest] consumers call
 /// [complete()](DeviceRequest::complete()), rather than silently dropping it.
 struct NoDropDevReq;
@@ -192,6 +313,10 @@ struct QmInner {
     /// removed from `in_flight`, as a means providing accurate results from
     /// [NoneInFlight].
     processing_last: usize,
+    /// Just enough state to manage time-based I/O completion flushes.
+    /// TODO: would be nice to move *all* the coalescing here. Might need to
+    /// give this a reference to `complete_bulk_fn` or something?
+    coalescer: Option<Arc<Coalescer>>,
 }
 impl Default for QmInner {
     fn default() -> Self {
@@ -204,6 +329,7 @@ impl Default for QmInner {
             in_flight: BTreeMap::new(),
             coalesced: Vec::new(),
             metric_consumer: None,
+            coalescer: None,
         }
     }
 }
@@ -242,6 +368,10 @@ impl QueueMinder {
         assert!(!state.destroyed);
         state.destroyed = true;
 
+        if let Some(coalescer) = state.coalescer.as_ref() {
+            coalescer.shutdown();
+        }
+
         if state.in_flight.len() > 0 {
             let old = std::mem::replace(&mut state.in_flight, BTreeMap::new());
             for (_, QmRequest { token, .. }) in old.into_iter() {
@@ -259,7 +389,14 @@ impl QueueMinder {
         assert_eq!(state.coalesced.len(), 0);
     }
 
+    fn enable_coalescing(&self, coalescer: Arc<Coalescer>) {
+        let mut state = self.state.lock().unwrap();
+        assert!(!state.destroyed);
+        state.coalescer = Some(coalescer);
+    }
+
     pub fn new<DQ: DeviceQueue>(
+        rt_handle: tokio::runtime::Handle,
         queue: Arc<DQ>,
         device_id: DeviceId,
         queue_id: QueueId,
@@ -297,7 +434,7 @@ impl QueueMinder {
             queue.complete_bulk(bulk);
         });
 
-        Arc::new_cyclic(|self_ref| Self {
+        let minder_ref = Arc::new_cyclic(|self_ref| Self {
             queue_id,
             device_id,
             state: Mutex::new(QmInner::default()),
@@ -307,7 +444,20 @@ impl QueueMinder {
             complete_req_fn,
             complete_bulk_fn,
             abandon_req_fn,
-        })
+        });
+
+        let minder = Arc::clone(&minder_ref);
+        let coalescer = Arc::new(Coalescer::new(minder));
+
+        let coalescer_ref = Arc::clone(&coalescer);
+        let _coalescer = rt_handle.spawn(async move {
+            coalescer_ref.coalesce_completions().await;
+        });
+
+        let minder = Arc::clone(&minder_ref);
+        minder.enable_coalescing(coalescer);
+
+        minder
     }
 
     /// Attempt to fetch the next IO request from this queue for a worker.
@@ -364,7 +514,6 @@ impl QueueMinder {
             Some(DeviceRequest::new(id, req, self.self_ref.clone()))
         } else {
             state.notify_workers.set(wid);
-            self.flush_coalesced(state, None);
             None
         }
     }
@@ -419,20 +568,24 @@ impl QueueMinder {
         }
 
         let op = ent.op;
-        if should_coalesce(ent.op, when_processed, &state.coalesced) {
-            // queue for a later coalesced completion
-            state.coalesced.push(QmResult::from_req(
-                ent,
-                result,
-                when_processed,
-            ));
+        let qm_result = QmResult::from_req(ent, result, when_processed);
+        if let Some(coalescer) = state.coalescer.as_ref() {
+            if coalescer.should_coalesce(op, &state.coalesced) {
+                // queue for a later coalesced completion
+                coalescer.completed_io();
+                state.coalesced.push(qm_result);
+            } else {
+                // deliver immediately completion (along with any others which have
+                // been coalesced)
+                self.flush_coalesced(state, Some(qm_result));
+            }
         } else {
-            // deliver immediately completion (along with any others which have
-            // been coalesced)
-            self.flush_coalesced(
-                state,
-                Some(QmResult::from_req(ent, result, when_processed)),
-            );
+            let QmResult { token, op, result, when_processed } = qm_result;
+            (self.complete_req_fn)(op, result, token);
+
+            probes::block_completion_single!(|| {
+                (devqid, when_processed.elapsed().as_nanos() as u64)
+            });
         }
 
         // Report the completion to the metrics consumer, if one exists
@@ -493,7 +646,8 @@ impl QueueMinder {
         // in-flight requests.
         if is_last_req {
             let mut state = self.state.lock().unwrap();
-            state.processing_last -= 1;
+            state.processing_last =
+                state.processing_last.checked_sub(1).expect("dont underflow");
             if state.in_flight.is_empty() && state.processing_last == 0 {
                 self.notify.notify_waiters();
             }
@@ -587,28 +741,6 @@ impl Future for NoneInFlight<'_> {
             }
         }
     }
-}
-
-// Arbitrary limits for now
-const COALESCE_MAX_COUNT: usize = 16;
-const COALESCE_MAX_WAIT_US: usize = 100;
-
-fn should_coalesce(op: Operation, now: Instant, existing: &[QmResult]) -> bool {
-    if op.is_flush() {
-        return false;
-    }
-    if existing.len() >= COALESCE_MAX_COUNT {
-        return false;
-    }
-    if let Some(item) = existing.get(0) {
-        if (item.when_processed.duration_since(now).as_micros() as usize)
-            >= COALESCE_MAX_WAIT_US
-        {
-            return false;
-        }
-    }
-
-    true
 }
 
 /// Unique ID assigned to a given block [Request].

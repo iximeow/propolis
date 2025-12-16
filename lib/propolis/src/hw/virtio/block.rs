@@ -52,6 +52,7 @@ impl PciVirtioBlock {
         );
 
         let block_attach = block::DeviceAttachment::new(
+            tokio::runtime::Handle::current(),
             NonZeroUsize::new(1).unwrap(),
             pci_state.acc_mem.child(Some("block backend".to_string())),
         );

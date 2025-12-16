@@ -378,7 +378,7 @@ unsafe impl Sync for Mapping {}
 // not reference them directly as a field.
 #[allow(dead_code)]
 enum Backing<'a> {
-    Base(Arc<Mapping>),
+    Base(&'a Mapping),
     Sub(&'a SubMapping<'a>),
 }
 
@@ -403,10 +403,10 @@ impl SubMapping<'_> {
     /// `Mapping` object.
     fn new_base<'a>(
         _mem: &'a MemCtx,
-        base: &'_ Arc<Mapping>,
+        base: &'a Arc<Mapping>,
     ) -> SubMapping<'a> {
         SubMapping {
-            backing: Backing::Base(base.clone()),
+            backing: Backing::Base(base),
 
             ptr: base.ptr,
             len: base.len,

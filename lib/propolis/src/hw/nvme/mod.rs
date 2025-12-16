@@ -867,6 +867,7 @@ impl PciNvme {
             .finish();
 
         let block_attach = block::DeviceAttachment::new(
+            tokio::runtime::Handle::current(),
             NonZeroUsize::new(MAX_NUM_IO_QUEUES).unwrap(),
             pci_state.acc_mem.child(Some("block backend".to_string())),
         );

@@ -93,6 +93,8 @@ mod probes {
     ) {
     }
 
+    fn block_queue_slot_state(dev_id: u64, worker_id: u64, qid: u8) {}
+    fn block_queue_slot_state_any(dev_id: u64, worker_id: u64, qid: u8) {}
     fn block_poll(devq_id: u64, worker_id: u64, emit_req: u8) {}
     fn block_sleep(dev_id: u32, worker_id: u64) {}
     fn block_wake(dev_id: u32, worker_id: u64) {}

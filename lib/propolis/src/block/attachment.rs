@@ -237,6 +237,11 @@ impl QueueCollection {
         let idx: usize = queue_select.into();
         let slot = self.queues.get(idx)?;
 
+        probes::block_queue_slot_state!(|| (
+            self.devid.0 as u64,
+            wid as u64,
+            idx as u8
+        ));
         let guard = slot.state.lock().unwrap();
         let minder = guard.minder.as_ref()?;
         let result = minder.next_req(wid);
@@ -263,6 +268,11 @@ impl QueueCollection {
 
         let (hit_qid, dreq) = queues
             .filter_map(|slot| {
+                probes::block_queue_slot_state_any!(|| (
+                    self.devid.0 as u64,
+                    wid as u64,
+                    idx as u8
+                ));
                 let guard = slot.state.lock().unwrap();
                 let minder = guard.minder.as_ref()?;
                 let result = minder.next_req(wid);
@@ -451,6 +461,7 @@ struct DeviceState {
 }
 
 struct DeviceAttachInner {
+    rt_handle: tokio::runtime::Handle,
     att_state: Mutex<Option<AttachPair>>,
     dev_state: Mutex<DeviceState>,
     queues: Arc<QueueCollection>,
@@ -464,10 +475,15 @@ impl DeviceAttachment {
     /// Create a [DeviceAttachment] for a given device.  The maximum number of
     /// queues which the device will ever expose is set via `max_queues`.  DMA
     /// done by attached backend workers will be through the provided `acc_mem`.
-    pub fn new(max_queues: NonZeroUsize, acc_mem: MemAccessor) -> Self {
+    pub fn new(
+        rt_handle: tokio::runtime::Handle,
+        max_queues: NonZeroUsize,
+        acc_mem: MemAccessor
+    ) -> Self {
         let device_id = DeviceId::new();
         let queues = QueueCollection::new(max_queues, device_id);
         Self(Arc::new(DeviceAttachInner {
+            rt_handle,
             att_state: Mutex::new(None),
             dev_state: Mutex::new(DeviceState::default()),
             queues,
@@ -502,7 +518,12 @@ impl DeviceAttachment {
         queue_id: QueueId,
         queue: Arc<impl DeviceQueue>,
     ) {
-        let minder = QueueMinder::new(queue, self.0.queues.devid, queue_id);
+        let minder = QueueMinder::new(
+            self.0.rt_handle.clone(),
+            queue,
+            self.0.queues.devid,
+            queue_id,
+        );
 
         let mut state = self.0.queues.state.lock().unwrap();
         let slot = self.0.queues.slot(queue_id);

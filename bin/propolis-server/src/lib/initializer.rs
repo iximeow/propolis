@@ -672,9 +672,12 @@ impl MachineInitializer<'_> {
 
                     // Limit data transfers to 1MiB (2^8 * 4k) in size
                     let mdts = Some(8);
+                    // TODO: plumb this in from `nvme_spec`.
+                    let model_number = [0u8; 40];
                     let component = format!("nvme-{device_id}");
                     let nvme = nvme::PciNvme::create(
                         &nvme_spec.serial_number,
+                        &model_number,
                         mdts,
                         self.log.new(slog::o!("component" => component)),
                     );

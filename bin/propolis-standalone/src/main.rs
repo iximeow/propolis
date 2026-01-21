@@ -1290,8 +1290,28 @@ fn setup_instance(
                     serial_number[..sz]
                         .clone_from_slice(&dev_serial.as_bytes()[..sz]);
 
-                    let nvme =
-                        hw::nvme::PciNvme::create(&serial_number, mdts, log);
+                    let mut model_number = [0u8; 40];
+                    let wanted_model = dev
+                        .options
+                        .get("model_number")
+                        .map(|mn| mn.as_str().unwrap().to_string())
+                        .unwrap_or_else(|| {
+                            let be = config
+                                .block_devs
+                                .get(&name)
+                                .expect("block device exists");
+                            format!("Oxide {} Disk", be.bdtype)
+                        });
+                    let mn = wanted_model.len().min(model_number.len());
+                    model_number[..mn]
+                        .clone_from_slice(&wanted_model.as_bytes()[..sz]);
+
+                    let nvme = hw::nvme::PciNvme::create(
+                        &serial_number,
+                        &model_number,
+                        mdts,
+                        log,
+                    );
 
                     guard.inventory.register_instance(&nvme, &bdf.to_string());
                     guard.inventory.register_block(&backend, name);

@@ -806,6 +806,7 @@ impl PciNvme {
     /// Create a new pci-nvme device with the given values
     pub fn create(
         serial_number: &[u8; 20],
+        model_number: &[u8; 40],
         mdts: Option<u8>,
         log: slog::Logger,
     ) -> Arc<Self> {
@@ -833,6 +834,7 @@ impl PciNvme {
             vid: VENDOR_OXIDE,
             ssvid: VENDOR_OXIDE,
             sn: *serial_number,
+            mn: *model_number,
             ieee: OXIDE_OUI,
             mdts: mdts.unwrap_or(0),
             // We use standard Completion/Submission Queue Entry structures with no extra

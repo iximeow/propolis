@@ -68,6 +68,7 @@ const MAX_ADMIN_QUEUE_SIZE: u32 = 1 << 12;
 pub const ADMIN_QUEUE_ID: QueueId = 0;
 
 /// Completion Queue State
+#[repr(C)]
 struct CompQueueState {
     /// Number of entries that are available for use.
     ///
@@ -121,6 +122,7 @@ impl<QS> QueueState<QS> {
         Self {
             size,
             inner: Mutex::new(QueueInner {
+                magic: [b'Q', b'U', b'E', b'U', b'E', b'_', b'Q', b'S'],
                 head: 0,
                 tail: 0,
                 db_buf: None,
@@ -177,7 +179,12 @@ fn validate(
     Ok(())
 }
 
+#[repr(C)]
 struct QueueInner<QS> {
+    /// A byte sequence to identify this QueueState in a memory dump.
+    /// Should be "QUEUE_QS"
+    magic: [u8; 8],
+
     /// The Queue Head entry pointer.
     ///
     /// The consumer of entries on a queue uses the current Head entry pointer
@@ -546,6 +553,7 @@ pub struct CreateParams {
 }
 
 /// Type for manipulating Submission Queues.
+#[repr(C)]
 pub struct SubQueue {
     /// The ID of this Submission Queue.
     id: QueueId,
@@ -735,6 +743,7 @@ impl SubQueue {
 }
 
 /// Type for manipulating Completion Queues.
+#[repr(C)]
 pub struct CompQueue {
     /// The ID of this Completion Queue.
     id: QueueId,
@@ -800,6 +809,11 @@ impl CompQueue {
         let state = self.state.lock();
         if !state.is_empty() {
             self.hdl.fire(self.iv);
+        } else {
+            eprintln!(
+                "deferring interrupt because someone \
+                 else already signalled for me!"
+            );
         }
     }
 
@@ -1067,6 +1081,9 @@ impl Permit {
     /// ensure-this-permit-is-completed check in [`Drop`].
     pub fn abandon(self) {
         let Permit { _nodrop, .. } = self;
+        unsafe {
+            std::arch::asm!("int $3");
+        }
         std::mem::forget(_nodrop);
     }
 

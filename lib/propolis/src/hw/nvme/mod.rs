@@ -180,7 +180,12 @@ const MAX_NUM_QUEUES: usize = 16;
 const MAX_NUM_IO_QUEUES: usize = MAX_NUM_QUEUES - 1;
 
 /// NVMe Controller
+#[repr(C)]
 struct NvmeCtrl {
+    /// A sequence of some recognizable-in-memory bytes to assist in finding
+    /// this structure from a debugger.
+    magic: [u8; 8],
+
     /// A distinguishing identifier for this NVMe controller across the VM.
     /// Useful mostly to distinguish queues and commands as seen in probes.
     /// `device_id` is held constant across NVMe resets, but not persisted
@@ -691,6 +696,7 @@ impl NvmeCtrl {
 }
 
 #[derive(Default)]
+#[repr(C)]
 struct NvmeQueues {
     sqs: [Mutex<Option<Arc<SubQueue>>>; MAX_NUM_QUEUES],
     cqs: [Mutex<Option<Arc<CompQueue>>>; MAX_NUM_QUEUES],
@@ -770,6 +776,7 @@ impl NvmeQueues {
 }
 
 /// NVMe over PCIe
+#[repr(C)]
 pub struct PciNvme {
     /// NVMe Controller
     state: Mutex<NvmeCtrl>,
@@ -801,6 +808,9 @@ pub struct PciNvme {
     /// Logger resource
     log: slog::Logger,
 }
+
+#[no_mangle]
+static NVME_CONTROLLERS: Mutex<Vec<Arc<PciNvme>>> = Mutex::new(Vec::new());
 
 impl PciNvme {
     /// Create a new pci-nvme device with the given values
@@ -891,6 +901,7 @@ impl PciNvme {
         let csts = Status(0);
 
         let state = NvmeCtrl {
+            magic: [b'N', b'V', b'M', b'e', b'C', b'T', b'R', b'L'],
             device_id: DeviceId::new(),
             ctrl: CtrlState { cap, cc, csts, ..Default::default() },
             doorbell_buf: None,
@@ -914,7 +925,7 @@ impl PciNvme {
             pci_state.acc_mem.child(Some("block backend".to_string())),
         );
 
-        Arc::new_cyclic(move |self_weak: &Weak<PciNvme>| {
+        let this = Arc::new_cyclic(move |self_weak: &Weak<PciNvme>| {
             let this = self_weak.clone();
             block_attach.on_attach(Box::new(move |info| {
                 if let Some(this) = Weak::upgrade(&this) {
@@ -934,7 +945,11 @@ impl PciNvme {
                 block_attach,
                 log,
             }
-        })
+        });
+
+        NVME_CONTROLLERS.lock().expect("not poisoned").push(Arc::clone(&this));
+
+        this
     }
 
     /// Service a write to the NVMe Controller Configuration from the VM

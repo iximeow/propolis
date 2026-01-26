@@ -151,6 +151,7 @@ fn wrap_add(size: u32, idx: u16, off: u16) -> u16 {
         res as u16
     }
 }
+
 fn wrap_sub(size: u32, idx: u16, off: u16) -> u16 {
     debug_assert!(u32::from(idx) < size);
     debug_assert!(u32::from(off) < size);
@@ -807,14 +808,18 @@ impl CompQueue {
     /// if the queue is not currently empty.
     pub fn fire_interrupt(&self) {
         let state = self.state.lock();
+        /*
         if !state.is_empty() {
+        */
             self.hdl.fire(self.iv);
+        /*
         } else {
             eprintln!(
                 "deferring interrupt because someone \
                  else already signalled for me!"
             );
         }
+        */
     }
 
     /// Returns whether the SQIDs should be kicked due to no permits being
@@ -868,6 +873,7 @@ impl CompQueue {
         let (idx, phase) = state
             .push_tail()
             .expect("CQ should have available space for assigned permit");
+        let head_then = state.state.head;
 
         probes::nvme_cqe!(|| (self.devq_id(), idx, u8::from(phase)));
 
@@ -886,6 +892,7 @@ impl CompQueue {
         // TODO: access disallowed?
         let Some(mem) = self.state.acc_mem.access_borrow() else {
             // TODO: mark the queue/controller in error state?
+            panic!("mem access?");
             return;
         };
         let mem = mem.view();
@@ -897,6 +904,14 @@ impl CompQueue {
         let devq_id = self.devq_id();
         state.db_buf_read(devq_id, &mem);
         state.db_buf_write(devq_id, &mem);
+
+        // if the guest wrote the doorbell shadow concurrent with us, it's
+        // possible that the tail moved and we'll see no occupied entries
+        // anymore.
+        let head_now = state.state.head;
+
+        // we just pushed one!!!
+        assert!(head_then != head_now || state.avail_occupied() > 0);
     }
 
     pub(super) fn set_db_buf(

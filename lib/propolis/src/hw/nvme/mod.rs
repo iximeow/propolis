@@ -855,7 +855,7 @@ impl PciNvme {
             // bit 0 indicates volatile write cache is present
             vwc: 1,
             // bit 8 indicates Doorbell Buffer support
-            oacs: (1 << 8),
+            oacs: (0 << 8),
             ..Default::default()
         };
 

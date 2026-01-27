@@ -122,9 +122,11 @@ impl<QS> QueueState<QS> {
         Self {
             size,
             inner: Mutex::new(QueueInner {
-                magic: [b'Q', b'U', b'E', b'U', b'E', b'_', b'Q', b'S'],
+                magic: [b'Q', b'U', b'E', b'U', b'E', b'_', b'Q', b'T'],
                 head: 0,
                 tail: 0,
+                magic2: [b'I', b'N', b'T', b'R'],
+                last_notif_idx: 0,
                 db_buf: None,
                 inner,
             }),
@@ -201,6 +203,12 @@ struct QueueInner<QS> {
     ///
     /// See NVMe 1.0e Section 4.1 Submission Queue & Completion Queue Definition
     tail: u16,
+
+    /// Debugging: the index of the tail as of the last time we sent an
+    /// interrupt (cq) or processed a doorbell ring (sq).
+    last_notif_idx: u16,
+
+    magic2: [u8; 4],
 
     /// Doorbell Buffer for assisting in elision of doorbell ringing
     db_buf: Option<DoorbellBuffer>,
@@ -623,6 +631,7 @@ impl SubQueue {
     pub fn notify_tail(&self, idx: u16) -> Result<u16, QueueUpdateError> {
         let mut state = self.state.lock();
         state.push_tail_to(idx)?;
+        state.state.last_notif_idx = idx;
         if self.id == ADMIN_QUEUE_ID {
             if let Some(mem) = state.acc_mem.access() {
                 state.db_buf_write_shadow(self.devq_id(), &mem);
@@ -807,19 +816,16 @@ impl CompQueue {
     /// Fires an interrupt to the guest with the associated interrupt vector
     /// if the queue is not currently empty.
     pub fn fire_interrupt(&self) {
-        let state = self.state.lock();
-        /*
+        let mut state = self.state.lock();
         if !state.is_empty() {
-        */
+            state.state.last_notif_idx = state.state.tail;
             self.hdl.fire(self.iv);
-        /*
         } else {
             eprintln!(
                 "deferring interrupt because someone \
                  else already signalled for me!"
             );
         }
-        */
     }
 
     /// Returns whether the SQIDs should be kicked due to no permits being

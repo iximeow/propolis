@@ -369,8 +369,8 @@ impl QueueGuard<'_, CompQueueState> {
             // When checking for available space before issuing a Permit, we can
             // perform our own JIT read from the db_buf to stay updated on the
             // true space available.
-            fence(Ordering::Release);
             mem.write(db_buf.eventidx, &self.state.tail);
+            fence(Ordering::Release);
         }
     }
 
@@ -382,14 +382,15 @@ impl QueueGuard<'_, CompQueueState> {
     fn db_buf_write_shadow(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
             probes::nvme_cq_dbbuf_write_shadow!(|| (devq_id, self.state.head));
-            fence(Ordering::Release);
             mem.write(db_buf.shadow, &self.state.head);
+            fence(Ordering::Release);
         }
     }
 
     /// Read update from the Shadow in Doorbell Buffer page, if possible
     fn db_buf_read(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
+            fence(Ordering::Acquire);
             if let Some(new_head) = mem.read::<u32>(db_buf.shadow) {
                 let new_head = *new_head;
                 probes::nvme_cq_dbbuf_read!(|| (
@@ -397,7 +398,6 @@ impl QueueGuard<'_, CompQueueState> {
                     new_head,
                     self.state.head
                 ));
-                fence(Ordering::Acquire);
                 // TODO: roll back on bad input?
                 if let Err(e) = self.pop_head_to(new_head as u16) {
                     eprintln!("error: {}", e);
@@ -493,8 +493,8 @@ impl QueueGuard<'_, SubQueueState> {
             // We proactively read from the db_buf shadow while attempted to pop
             // entries submitted to the queue.  Only once it is empty, with the
             // head/tail being equal, do we want doorbell calls from the guest.
-            fence(Ordering::Release);
             mem.write(db_buf.eventidx, &self.state.head);
+            fence(Ordering::Release);
         }
     }
 
@@ -505,14 +505,15 @@ impl QueueGuard<'_, SubQueueState> {
     fn db_buf_write_shadow(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
             probes::nvme_sq_dbbuf_write_shadow!(|| (devq_id, self.state.tail));
-            fence(Ordering::Release);
             mem.write(db_buf.shadow, &self.state.tail);
+            fence(Ordering::Release);
         }
     }
 
     /// Read update from the Shadow in Doorbell Buffer page, if possible
     fn db_buf_read(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
+            fence(Ordering::Acquire);
             if let Some(new_tail) = mem.read::<u32>(db_buf.shadow) {
                 let new_tail = *new_tail;
                 probes::nvme_sq_dbbuf_read!(|| (
@@ -520,7 +521,6 @@ impl QueueGuard<'_, SubQueueState> {
                     new_tail,
                     self.state.head
                 ));
-                fence(Ordering::Acquire);
                 // TODO: roll back on bad input?
                 let _ = self.push_tail_to(new_tail as u16);
             }

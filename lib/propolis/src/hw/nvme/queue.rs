@@ -399,7 +399,12 @@ impl QueueGuard<'_, CompQueueState> {
                 ));
                 fence(Ordering::Acquire);
                 // TODO: roll back on bad input?
-                let _ = self.pop_head_to(new_head as u16);
+                if let Err(e) = self.pop_head_to(new_head as u16) {
+                    eprintln!("error: {}", e);
+                    unsafe {
+                        std::arch::asm!("int $3;");
+                    }
+                }
             }
         }
     }
@@ -804,7 +809,12 @@ impl CompQueue {
     /// Attempt to move the Head entry pointer forward to the given index.
     pub fn notify_head(&self, idx: u16) -> Result<(), QueueUpdateError> {
         let mut state = self.state.lock();
-        state.pop_head_to(idx)?;
+        if let Err(e) = state.pop_head_to(idx) {
+            eprintln!("error: {}", e);
+            unsafe {
+                std::arch::asm!("int $3;");
+            }
+        }
         if self.id == ADMIN_QUEUE_ID {
             if let Some(mem) = state.acc_mem.access() {
                 state.db_buf_write_shadow(self.devq_id(), &mem)

@@ -366,6 +366,9 @@ impl QueueGuard<'_, CompQueueState> {
     fn db_buf_write(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
             probes::nvme_cq_dbbuf_write!(|| (devq_id, self.state.tail));
+            unsafe {
+                mfence();
+            }
             // Keep EventIdx populated with the position of the CQ tail.  We are
             // not especially concerned with receiving timely (doorbell) updates
             // from the guest about where the head pointer sits.  We keep our
@@ -376,10 +379,6 @@ impl QueueGuard<'_, CompQueueState> {
             // perform our own JIT read from the db_buf to stay updated on the
             // true space available.
             mem.write(db_buf.eventidx, &self.state.tail);
-            // Safety: trust me : )
-            unsafe {
-                mfence();
-            }
         }
     }
 
@@ -391,11 +390,11 @@ impl QueueGuard<'_, CompQueueState> {
     fn db_buf_write_shadow(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
             probes::nvme_cq_dbbuf_write_shadow!(|| (devq_id, self.state.head));
-            mem.write(db_buf.shadow, &self.state.head);
             // Safety: trust me : )
             unsafe {
                 mfence();
             }
+            mem.write(db_buf.shadow, &self.state.head);
         }
     }
 
@@ -499,6 +498,10 @@ impl QueueGuard<'_, SubQueueState> {
     /// Write update to the EventIdx in Doorbell Buffer page, if possible
     fn db_buf_write(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
+            // Safety: trust me : )
+            unsafe {
+                mfence();
+            }
             probes::nvme_sq_dbbuf_write!(|| (devq_id, self.state.head));
             // Keep EventIdx populated with the position of the SQ head.  As
             // long as there are entries available between the head and tail, we
@@ -509,10 +512,6 @@ impl QueueGuard<'_, SubQueueState> {
             // entries submitted to the queue.  Only once it is empty, with the
             // head/tail being equal, do we want doorbell calls from the guest.
             mem.write(db_buf.eventidx, &self.state.head);
-            // Safety: trust me : )
-            unsafe {
-                mfence();
-            }
         }
     }
 
@@ -522,12 +521,12 @@ impl QueueGuard<'_, SubQueueState> {
     /// write to a "guest-owned" page.
     fn db_buf_write_shadow(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
-            probes::nvme_sq_dbbuf_write_shadow!(|| (devq_id, self.state.tail));
-            mem.write(db_buf.shadow, &self.state.tail);
             // Safety: trust me : )
             unsafe {
                 mfence();
             }
+            probes::nvme_sq_dbbuf_write_shadow!(|| (devq_id, self.state.tail));
+            mem.write(db_buf.shadow, &self.state.tail);
         }
     }
 

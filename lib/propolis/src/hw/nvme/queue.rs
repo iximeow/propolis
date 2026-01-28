@@ -699,7 +699,14 @@ impl SubQueue {
         let mem = mem.view();
 
         // Attempt to reserve an entry on the Completion Queue
-        let permit = self.cq.reserve_entry(&self, &mem)?;
+        let Some(permit) = self.cq.reserve_entry(&self, &mem) else {
+            if self.state.lock().state.db_buf.is_some() {
+                eprintln!("couldn't reserve cq entry");
+                return None;
+            } else {
+                return None;
+            }
+        };
         let mut state = self.state.lock();
 
         // Check for last-minute updates to the tail via any configured doorbell
@@ -872,10 +879,12 @@ impl CompQueue {
             state.state.last_notif_idx = state.state.tail;
             self.hdl.fire(self.iv);
         } else {
+            /*
             eprintln!(
                 "deferring interrupt because someone \
                  else already signalled for me!"
             );
+            */
         }
     }
 

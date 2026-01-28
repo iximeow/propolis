@@ -67,6 +67,12 @@ const MAX_ADMIN_QUEUE_SIZE: u32 = 1 << 12;
 /// See NVMe 1.0e Section 1.6.1 Admin Queue
 pub const ADMIN_QUEUE_ID: QueueId = 0;
 
+// wrap the intrinsic from core for no good reason.
+unsafe fn mfence() {
+    // core::arch::x86::_mm_mfence();
+    std::arch::asm!("mfence"); // i will get out and push ffs
+}
+
 /// Completion Queue State
 #[repr(C)]
 struct CompQueueState {
@@ -370,7 +376,10 @@ impl QueueGuard<'_, CompQueueState> {
             // perform our own JIT read from the db_buf to stay updated on the
             // true space available.
             mem.write(db_buf.eventidx, &self.state.tail);
-            fence(Ordering::Release);
+            // Safety: trust me : )
+            unsafe {
+                mfence();
+            }
         }
     }
 
@@ -383,14 +392,20 @@ impl QueueGuard<'_, CompQueueState> {
         if let Some(db_buf) = self.state.db_buf {
             probes::nvme_cq_dbbuf_write_shadow!(|| (devq_id, self.state.head));
             mem.write(db_buf.shadow, &self.state.head);
-            fence(Ordering::Release);
+            // Safety: trust me : )
+            unsafe {
+                mfence();
+            }
         }
     }
 
     /// Read update from the Shadow in Doorbell Buffer page, if possible
     fn db_buf_read(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
-            fence(Ordering::Acquire);
+            // Safety: trust me : )
+            unsafe {
+                mfence();
+            }
             if let Some(new_head) = mem.read::<u32>(db_buf.shadow) {
                 let new_head = *new_head;
                 probes::nvme_cq_dbbuf_read!(|| (
@@ -494,7 +509,10 @@ impl QueueGuard<'_, SubQueueState> {
             // entries submitted to the queue.  Only once it is empty, with the
             // head/tail being equal, do we want doorbell calls from the guest.
             mem.write(db_buf.eventidx, &self.state.head);
-            fence(Ordering::Release);
+            // Safety: trust me : )
+            unsafe {
+                mfence();
+            }
         }
     }
 
@@ -506,14 +524,20 @@ impl QueueGuard<'_, SubQueueState> {
         if let Some(db_buf) = self.state.db_buf {
             probes::nvme_sq_dbbuf_write_shadow!(|| (devq_id, self.state.tail));
             mem.write(db_buf.shadow, &self.state.tail);
-            fence(Ordering::Release);
+            // Safety: trust me : )
+            unsafe {
+                mfence();
+            }
         }
     }
 
     /// Read update from the Shadow in Doorbell Buffer page, if possible
     fn db_buf_read(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
-            fence(Ordering::Acquire);
+            // Safety: trust me : )
+            unsafe {
+                mfence();
+            }
             if let Some(new_tail) = mem.read::<u32>(db_buf.shadow) {
                 let new_tail = *new_tail;
                 probes::nvme_sq_dbbuf_read!(|| (

@@ -365,7 +365,20 @@ impl QueueGuard<'_, CompQueueState> {
     /// Write update to the EventIdx in Doorbell Buffer page, if possible
     fn db_buf_write(&mut self, devq_id: u64, mem: &MemCtx) {
         if let Some(db_buf) = self.state.db_buf {
-            probes::nvme_cq_dbbuf_write!(|| (devq_id, self.state.tail));
+            // the last position we're willing to set the CQ head event index is
+            // one less than the actual tail of the queue. make sure we don't
+            // fully fill the CQ, get SQs corked, and do all this while opting
+            // out of a CQ doorbell.
+            let next_evtidx = if self.avail_occupied() > 1 {
+                // self.state.tail - 1 mod size
+                self.idx_sub(self.state.tail, 1)
+            } else {
+                // `tail` has not advanced far enough that we can actually
+                // advance eventidx.
+                return;
+            };
+
+            probes::nvme_cq_dbbuf_write!(|| (devq_id, next_evtidx));
             unsafe {
                 mfence();
             }
@@ -378,7 +391,7 @@ impl QueueGuard<'_, CompQueueState> {
             // When checking for available space before issuing a Permit, we can
             // perform our own JIT read from the db_buf to stay updated on the
             // true space available.
-            mem.write(db_buf.eventidx, &self.state.tail);
+            mem.write(db_buf.eventidx, &next_evtidx);
             unsafe {
                 mfence();
             }
@@ -699,19 +712,9 @@ impl SubQueue {
         let mem = mem.view();
 
         // Attempt to reserve an entry on the Completion Queue
-        let Some(permit) = self.cq.reserve_entry(&self, &mem) else {
-            // this queue may be corked on the cq, what if the cq becomes
-            // uncorked or something because of shadow doorbell instead of PCI
-            // register?
-            if self.state.lock().state.db_buf.is_some() {
-                eprintln!("couldn't reserve cq entry");
-                return None;
-            } else {
-                return None;
-            }
-        };
-        let mut state = self.state.lock();
+        let permit = self.cq.reserve_entry(&self, &mem)?;
 
+        let mut state = self.state.lock();
         // Check for last-minute updates to the tail via any configured doorbell
         // page, prior to attempting the pop itself.
         state.db_buf_read(self.devq_id(), &mem);
@@ -919,29 +922,12 @@ impl CompQueue {
         mem: &MemCtx,
     ) -> Option<ProtoPermit> {
         let mut state = self.state.lock();
-        if state.state.db_buf.is_some() && state.state.inner.avail < 3 {
-            // if the doorbell buffer is configured, do not allow avail to hit
-            // 0. in that case, if all I/Os complete and are posted before the
-            // acknowledges any of them, a submission queue doorbell ring will
-            // get the submission queue to pause on the completion queue. but
-            // the completion queue won't get a doorbell ring for any of those
-            // completions getting read, which means the submission queue will
-            // never get woken up and I/Os will never get processed.
-            //
-            // we actually need to just not set the event index to some magic
-            // too-high value, but i'm not sure what that is (it doesn't
-            // prohibit us from accepting requests OR posting completions,
-            // just.. don't set eventidx so high we stay asleep.)
-            return None;
-        }
-        /*
         if !state.has_avail() {
             // If the CQ appears full, but the db_buf shadow is configured, do a
             // last-minute check to see if entries have been consumed/freed
             // without a doorbell call.
             state.db_buf_read(self.devq_id(), mem);
         }
-        */
         if state.take_avail(sq) {
             Some(ProtoPermit::new(self, sq))
         } else {

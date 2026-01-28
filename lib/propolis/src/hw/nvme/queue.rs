@@ -379,6 +379,9 @@ impl QueueGuard<'_, CompQueueState> {
             // perform our own JIT read from the db_buf to stay updated on the
             // true space available.
             mem.write(db_buf.eventidx, &self.state.tail);
+            unsafe {
+                mfence();
+            }
         }
     }
 
@@ -395,6 +398,9 @@ impl QueueGuard<'_, CompQueueState> {
                 mfence();
             }
             mem.write(db_buf.shadow, &self.state.head);
+            unsafe {
+                mfence();
+            }
         }
     }
 
@@ -406,6 +412,9 @@ impl QueueGuard<'_, CompQueueState> {
                 mfence();
             }
             if let Some(new_head) = mem.read::<u32>(db_buf.shadow) {
+                unsafe {
+                    mfence();
+                }
                 let new_head = *new_head;
                 probes::nvme_cq_dbbuf_read!(|| (
                     devq_id,
@@ -512,6 +521,9 @@ impl QueueGuard<'_, SubQueueState> {
             // entries submitted to the queue.  Only once it is empty, with the
             // head/tail being equal, do we want doorbell calls from the guest.
             mem.write(db_buf.eventidx, &self.state.head);
+            unsafe {
+                mfence();
+            }
         }
     }
 
@@ -527,6 +539,9 @@ impl QueueGuard<'_, SubQueueState> {
             }
             probes::nvme_sq_dbbuf_write_shadow!(|| (devq_id, self.state.tail));
             mem.write(db_buf.shadow, &self.state.tail);
+            unsafe {
+                mfence();
+            }
         }
     }
 
@@ -538,6 +553,9 @@ impl QueueGuard<'_, SubQueueState> {
                 mfence();
             }
             if let Some(new_tail) = mem.read::<u32>(db_buf.shadow) {
+                unsafe {
+                    mfence();
+                }
                 let new_tail = *new_tail;
                 probes::nvme_sq_dbbuf_read!(|| (
                     devq_id,

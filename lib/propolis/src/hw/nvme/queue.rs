@@ -322,18 +322,7 @@ impl QueueGuard<'_, CompQueueState> {
 
     /// Is there available space in the CQ to push an entry?
     fn has_avail(&self) -> bool {
-        // HACK: only indicate that there is space available if there is >1
-        // ready. if there is exactly one available and doorbell buffers are
-        // configured and we consume that one entry, the guest will only notify
-        // completions by updating the shadow doorbell (which does not produce
-        // an event which would wake workers back up). instead, only indicate
-        // space is available if there are >1 entries. this way, we never
-        // advance the completion queue event index so far forward that we opt
-        // out of getting a doorbell for at least one of the in-flight i/os.
-        //
-        // TODO: don't think this reasoning is exactly correct but i wanna try
-        // it.
-        self.state.inner.avail > 1
+        self.state.inner.avail != 0
     }
 
     fn take_avail(&mut self, sq: &Arc<SubQueue>) -> bool {
@@ -711,6 +700,9 @@ impl SubQueue {
 
         // Attempt to reserve an entry on the Completion Queue
         let Some(permit) = self.cq.reserve_entry(&self, &mem) else {
+            // this queue may be corked on the cq, what if the cq becomes
+            // uncorked or something because of shadow doorbell instead of PCI
+            // register?
             if self.state.lock().state.db_buf.is_some() {
                 eprintln!("couldn't reserve cq entry");
                 return None;
@@ -927,12 +919,29 @@ impl CompQueue {
         mem: &MemCtx,
     ) -> Option<ProtoPermit> {
         let mut state = self.state.lock();
+        if state.state.db_buf.is_some() && state.state.inner.avail < 3 {
+            // if the doorbell buffer is configured, do not allow avail to hit
+            // 0. in that case, if all I/Os complete and are posted before the
+            // acknowledges any of them, a submission queue doorbell ring will
+            // get the submission queue to pause on the completion queue. but
+            // the completion queue won't get a doorbell ring for any of those
+            // completions getting read, which means the submission queue will
+            // never get woken up and I/Os will never get processed.
+            //
+            // we actually need to just not set the event index to some magic
+            // too-high value, but i'm not sure what that is (it doesn't
+            // prohibit us from accepting requests OR posting completions,
+            // just.. don't set eventidx so high we stay asleep.)
+            return None;
+        }
+        /*
         if !state.has_avail() {
             // If the CQ appears full, but the db_buf shadow is configured, do a
             // last-minute check to see if entries have been consumed/freed
             // without a doorbell call.
             state.db_buf_read(self.devq_id(), mem);
         }
+        */
         if state.take_avail(sq) {
             Some(ProtoPermit::new(self, sq))
         } else {

@@ -322,7 +322,18 @@ impl QueueGuard<'_, CompQueueState> {
 
     /// Is there available space in the CQ to push an entry?
     fn has_avail(&self) -> bool {
-        self.state.inner.avail != 0
+        // HACK: only indicate that there is space available if there is >1
+        // ready. if there is exactly one available and doorbell buffers are
+        // configured and we consume that one entry, the guest will only notify
+        // completions by updating the shadow doorbell (which does not produce
+        // an event which would wake workers back up). instead, only indicate
+        // space is available if there are >1 entries. this way, we never
+        // advance the completion queue event index so far forward that we opt
+        // out of getting a doorbell for at least one of the in-flight i/os.
+        //
+        // TODO: don't think this reasoning is exactly correct but i wanna try
+        // it.
+        self.state.inner.avail > 1
     }
 
     fn take_avail(&mut self, sq: &Arc<SubQueue>) -> bool {

@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! and here's a [broken::doc::link] :)
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;

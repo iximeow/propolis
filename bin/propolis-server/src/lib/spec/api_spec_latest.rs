@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Conversions from [`propolis_api_types::v6`] instance specs in the
+#![deny(rustdoc::broken_intra_doc_links)]
+
+//! https://www.not.a.link.com/url
+//! Conversions from [other::broken::link] instance specs in the
 //! [`propolis_api_types`] crate to the internal [`super::Spec`] representation.
 
 use std::collections::BTreeMap;
